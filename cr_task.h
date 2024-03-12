@@ -19,12 +19,25 @@ cr_executor_t* cr_executor_create(int worker_count);
 
 #ifdef CR_TASK_IMPL
 #include <assert.h>
-#include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <Windows.h>
+
+typedef CRITICAL_SECTION _cr_mutex_t;
+typedef CONDITION_VARIABLE _cr_cond_t;
+typedef HANDLE _cr_thread_t;
+#else
+#include <pthread.h>
+
+typedef pthread_mutex_t _cr_mutex_t;
+typedef pthread_cond_t _cr_cond_t;
+typedef pthread_t _cr_thread_t;
+#endif
 
 #define _cr_task_log(...) // do { printf("[cr_task]: "__VA_ARGS__); } while (0)
 
@@ -40,8 +53,8 @@ typedef struct _cr_task_ref_t _cr_task_ref_t;
 typedef struct _cr_pool_t _cr_pool_t;
 
 struct _cr_sync_t {
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
+    _cr_mutex_t mutex;
+    _cr_cond_t cond;
     int is_done;
 };
 
@@ -52,7 +65,7 @@ struct _cr_task_ref_t {
 };
 
 struct _cr_pool_t {
-    pthread_mutex_t mutex;
+    _cr_mutex_t mutex;
     void* batches[1llu << _CR_POOL_BATCH];
     uint64_t batch_count;
     uint64_t item_size;
@@ -76,9 +89,9 @@ struct cr_executor_t {
     _cr_pool_t task_pool;
     _cr_pool_t task_ref_pool;
     _Atomic uint64_t c;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    pthread_t* workers;
+    _cr_mutex_t mutex;
+    _cr_cond_t cond;
+    _cr_thread_t* workers;
 };
 
 void _cr_pool_init(_cr_pool_t* pool, uint64_t item_size);
@@ -91,8 +104,78 @@ void _cr_task_begin_signal(cr_task_t* task);
 void _cr_executor_schedule_task(cr_executor_t* executor, cr_task_t* task);
 void* _cr_executor_worker_func(void* args);
 
+#ifdef _WIN32
+int _cr_mutex_init(_cr_mutex_t* mutex) {
+    InitializeCriticalSection(mutex);
+    return 0;
+}
+
+int _cr_mutex_lock(_cr_mutex_t* mutex) {
+    EnterCriticalSection(mutex);
+    return 0;
+}
+
+int _cr_mutex_unlock(_cr_mutex_t* mutex) {
+    LeaveCriticalSection(mutex);
+    return 0;
+}
+
+int _cr_cond_init(_cr_cond_t* cond) {
+    InitializeConditionVariable(cond);
+    return 0;
+}
+
+int _cr_cond_wait(_cr_cond_t* cond, _cr_mutex_t* mutex) {
+    SleepConditionVariableCS(cond, mutex, INFINITE);
+    return 0;
+}
+
+int _cr_cond_signal(_cr_cond_t* cond) {
+    WakeConditionVariable(cond);
+    return 0;
+}
+
+DWORD __stdcall _cr_executor_worker_func_win32(void* parameter) {
+    _cr_executor_worker_func((cr_executor_t*) parameter);
+    return ERROR_SUCCESS;
+}
+
+int _cr_worker_create(_cr_thread_t* thread, cr_executor_t* executor) {
+    *thread = CreateThread(NULL, 0, _cr_executor_worker_func_win32, (void*) executor, 0, NULL);
+    return *thread == NULL;
+}
+#else
+int _cr_mutex_init(_cr_mutex_t* mutex) {
+    return pthread_mutex_init(mutex, NULL);
+}
+
+int _cr_mutex_lock(_cr_mutex_t* mutex) {
+    return pthread_mutex_lock(mutex);
+}
+
+int _cr_mutex_unlock(_cr_mutex_t* mutex) {
+    return pthread_mutex_unlock(mutex);
+}
+
+int _cr_cond_init(_cr_cond_t* cond) {
+    return pthread_cond_init(cond, NULL);
+}
+
+int _cr_cond_wait(_cr_cond_t* cond, _cr_mutex_t* mutex) {
+    return pthread_cond_wait(cond, mutex);
+}
+
+int _cr_cond_signal(_cr_cond_t* cond) {
+    return pthread_cond_signal(cond);
+}
+
+int _cr_worker_create(_cr_thread_t* thread, cr_executor_t* executor) {
+    return pthread_create(thread, NULL, _cr_executor_worker_func, executor);
+}
+#endif
+
 void _cr_pool_init(_cr_pool_t* pool, uint64_t item_size) {
-    pthread_mutex_init(&pool->mutex, NULL);
+    _cr_mutex_init(&pool->mutex);
     memset(pool->batches, 0, sizeof(pool->batches));
     pool->batch_count = 0;
     pool->item_size = item_size;
@@ -106,7 +189,7 @@ uint64_t _cr_pool_pop(_cr_pool_t* pool) {
     do {
         idx = c & _CR_POOL_IDX_MASK;
         if (idx == _CR_POOL_IDX_MASK) {
-            pthread_mutex_lock(&pool->mutex);
+            _cr_mutex_lock(&pool->mutex);
             c = atomic_load_explicit(&pool->c, memory_order_acquire);
             idx = c & _CR_POOL_IDX_MASK;
             if (idx == _CR_POOL_IDX_MASK) {
@@ -122,10 +205,10 @@ uint64_t _cr_pool_pop(_cr_pool_t* pool) {
                 void* item = (char*)(pool->batches[batch_idx]) + ((1llu << _CR_POOL_ITEM) - 1llu) * pool->item_size;
                 atomic_store_explicit((_Atomic uint32_t*)item, _CR_POOL_IDX_MASK, memory_order_relaxed);
                 atomic_store_explicit(&pool->c, idx | 1llu, memory_order_release);
-                pthread_mutex_unlock(&pool->mutex);
+                _cr_mutex_unlock(&pool->mutex);
                 return idx;
             }
-            pthread_mutex_unlock(&pool->mutex);
+            _cr_mutex_unlock(&pool->mutex);
         }
         uint64_t batch_idx = idx >> _CR_POOL_ITEM;
         uint64_t item_idx = idx & ((1llu << _CR_POOL_ITEM) - 1llu);
@@ -221,18 +304,18 @@ void cr_task_run(cr_task_t* task) {
 
 void cr_task_sync(cr_task_t* task) {
     _cr_sync_t sync;
-    pthread_mutex_init(&sync.mutex, NULL);
-    pthread_cond_init(&sync.cond, NULL);
+    _cr_mutex_init(&sync.mutex);
+    _cr_cond_init(&sync.cond);
     sync.is_done = 0;
     task->sync = &sync;
     uint64_t c = atomic_fetch_or_explicit(&task->signal, _CR_TASK_FLAG_SYNC, memory_order_acq_rel);
     assert((c & _CR_TASK_FLAG_SYNC) == 0 && "sync flag already set");
     if ((c & _CR_TASK_FLAG_S) == 0) {
-        pthread_mutex_lock(&sync.mutex);
+        _cr_mutex_lock(&sync.mutex);
         while (!sync.is_done) {
-            pthread_cond_wait(&sync.cond, &sync.mutex);
+            _cr_cond_wait(&sync.cond, &sync.mutex);
         }
-        pthread_mutex_unlock(&sync.mutex);
+        _cr_mutex_unlock(&sync.mutex);
     }
 }
 
@@ -255,10 +338,10 @@ void _cr_task_begin_signal(cr_task_t* task) {
     uint64_t c = atomic_fetch_or_explicit(&task->signal, _CR_TASK_FLAG_S, memory_order_acq_rel);
     assert((c & _CR_TASK_FLAG_S) == 0 && "tried to finalize more than once");
     if (c & _CR_TASK_FLAG_SYNC) {
-        pthread_mutex_lock(&task->sync->mutex);
+        _cr_mutex_lock(&task->sync->mutex);
         task->sync->is_done = 1;
-        pthread_cond_signal(&task->sync->cond);
-        pthread_mutex_unlock(&task->sync->mutex);
+        _cr_cond_signal(&task->sync->cond);
+        _cr_mutex_unlock(&task->sync->mutex);
     }
     uint64_t waiting_count = (c >> 32) & 0xffff;
     uint64_t idx = c & _CR_POOL_IDX_MASK;
@@ -278,15 +361,15 @@ void _cr_task_begin_signal(cr_task_t* task) {
 
 cr_executor_t* cr_executor_create(int worker_count) {
     size_t aligned_size_executor = (sizeof(cr_executor_t) + 255) & ~(size_t)0xff;
-    cr_executor_t* executor = malloc(aligned_size_executor + (size_t)worker_count * sizeof(pthread_t));
+    cr_executor_t* executor = malloc(aligned_size_executor + (size_t)worker_count * sizeof(_cr_thread_t));
     _cr_pool_init(&executor->task_pool, sizeof(cr_task_t));
     _cr_pool_init(&executor->task_ref_pool, sizeof(_cr_task_ref_t));
     atomic_store_explicit(&executor->c, _CR_POOL_IDX_MASK, memory_order_release);
-    pthread_mutex_init(&executor->mutex, NULL);
-    pthread_cond_init(&executor->cond, NULL);
-    executor->workers = (pthread_t*)((char*)executor + aligned_size_executor);
+    _cr_mutex_init(&executor->mutex);
+    _cr_cond_init(&executor->cond);
+    executor->workers = (_cr_thread_t*)((char*)executor + aligned_size_executor);
     for (int i = 0; i < worker_count; i++) {
-        pthread_create(&executor->workers[i], NULL, _cr_executor_worker_func, executor);
+        _cr_worker_create(&executor->workers[i], executor);
     }
     return executor;
 }
@@ -297,22 +380,22 @@ void _cr_executor_schedule_task(cr_executor_t* executor, cr_task_t* task) {
     do {
         uint64_t idx = c & _CR_POOL_IDX_MASK;
         if (idx == _CR_POOL_IDX_MASK) {
-            pthread_mutex_lock(&executor->mutex);
+            _cr_mutex_lock(&executor->mutex);
             c = atomic_load_explicit(&executor->c, memory_order_acquire);
             idx = c & _CR_POOL_IDX_MASK;
             if (idx == _CR_POOL_IDX_MASK) {
                 atomic_store_explicit(&task->next_idx_list, _CR_POOL_IDX_MASK, memory_order_relaxed);
                 atomic_store_explicit(&executor->c, task->idx, memory_order_release);
-                pthread_cond_signal(&executor->cond);
-                pthread_mutex_unlock(&executor->mutex);
+                _cr_cond_signal(&executor->cond);
+                _cr_mutex_unlock(&executor->mutex);
                 return;
             }
-            pthread_mutex_unlock(&executor->mutex);
+            _cr_mutex_unlock(&executor->mutex);
         }
         atomic_store_explicit(&task->next_idx_list, (uint32_t)idx, memory_order_relaxed);
         n = ((c + (1llu << 32)) & ~_CR_POOL_IDX_MASK) | task->idx;
     } while (!atomic_compare_exchange_weak_explicit(&executor->c, &c, n, memory_order_acq_rel, memory_order_acquire));
-    pthread_cond_signal(&executor->cond);
+    _cr_cond_signal(&executor->cond);
 }
 
 void* _cr_executor_worker_func(void* args) {
@@ -324,15 +407,15 @@ void* _cr_executor_worker_func(void* args) {
         do {
             uint64_t idx = c & _CR_POOL_IDX_MASK;
             if (idx == _CR_POOL_IDX_MASK) {
-                pthread_mutex_lock(&executor->mutex);
+                _cr_mutex_lock(&executor->mutex);
                 c = atomic_load_explicit(&executor->c, memory_order_acquire);
                 idx = c & _CR_POOL_IDX_MASK;
                 if (idx == _CR_POOL_IDX_MASK) {
-                    pthread_cond_wait(&executor->cond, &executor->mutex);
-                    pthread_mutex_unlock(&executor->mutex);
+                    _cr_cond_wait(&executor->cond, &executor->mutex);
+                    _cr_mutex_unlock(&executor->mutex);
                     goto next_task;
                 }
-                pthread_mutex_unlock(&executor->mutex);
+                _cr_mutex_unlock(&executor->mutex);
             }
             uint64_t batch_idx = idx >> _CR_POOL_ITEM;
             uint64_t item_idx = idx & ((1llu << _CR_POOL_ITEM) - 1llu);
