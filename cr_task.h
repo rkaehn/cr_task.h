@@ -279,14 +279,16 @@ void _cr_task_begin_signal(cr_task_t* task) {
 cr_executor_t* cr_executor_create(int worker_count) {
     size_t aligned_size_executor = (sizeof(cr_executor_t) + 255) & ~(size_t)0xff;
     cr_executor_t* executor = malloc(aligned_size_executor + (size_t)worker_count * sizeof(pthread_t));
-    _cr_pool_init(&executor->task_pool, sizeof(cr_task_t));
-    _cr_pool_init(&executor->task_ref_pool, sizeof(_cr_task_ref_t));
-    atomic_store_explicit(&executor->c, _CR_POOL_IDX_MASK, memory_order_release);
-    pthread_mutex_init(&executor->mutex, NULL);
-    pthread_cond_init(&executor->cond, NULL);
-    executor->workers = (pthread_t*)((char*)executor + aligned_size_executor);
-    for (int i = 0; i < worker_count; i++) {
-        pthread_create(&executor->workers[i], NULL, _cr_executor_worker_func, executor);
+    if (executor) {
+        _cr_pool_init(&executor->task_pool, sizeof(cr_task_t));
+        _cr_pool_init(&executor->task_ref_pool, sizeof(_cr_task_ref_t));
+        atomic_store_explicit(&executor->c, _CR_POOL_IDX_MASK, memory_order_release);
+        pthread_mutex_init(&executor->mutex, NULL);
+        pthread_cond_init(&executor->cond, NULL);
+        executor->workers = (pthread_t*)((char*)executor + aligned_size_executor);
+        for (int i = 0; i < worker_count; i++) {
+            pthread_create(&executor->workers[i], NULL, _cr_executor_worker_func, executor);
+        }
     }
     return executor;
 }
