@@ -66,7 +66,7 @@ static void setup(void* args) {
             m_t sr = 0;
             uint32_t r = 0;
             for (uint64_t i = 0; i < M; i++) {
-                if (i % 32 == 0) r = arc4random();
+                if (i % 32 == 0) r = rand();
                 m_t v = r & 1;
                 c[i * N + n] = v;
                 s[i * N + n] = sr;
